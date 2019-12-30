@@ -1,0 +1,38 @@
+BUILD_PREFIX = /opt/devkitpro/devkitARM/bin/arm-none-eabi-
+CC = $(BUILD_PREFIX)gcc
+CXX = $(BUILD_PREFIX)g++
+AS = $(BUILD_PREFIX)as
+AR = $(BUILD_PREFIX)ar
+OBJCOPY = $(BUILD_PREFIX)objcopy
+STRIP = $(BUILD_PREFIX)strip
+NM = $(BUILD_PREFIX)gcc-nm
+RANLIB = $(BUILD_PREFIX)gcc-ranlib
+LD = $(CXX)
+
+ARCH = -mthumb -mthumb-interwork
+
+LIBGBA	:=	/opt/devkitpro/libgba
+
+CFLAGS = -Wall -O4 -mcpu=arm7tdmi -mtune=arm7tdmi $(ARCH) -Ibuild
+CXXFLAGS = $(CFLAGS) -fno-rtti -fno-exceptions
+ASFLAGS	= $(ARCH) 
+LDFLAGS = $(ARCH)
+
+!bin2o = |> bin2s %f | $(AS) -o %o && \
+       echo "extern const u8" `(echo %b | sed -e 's/^\([0-9]\)/_\1/' -e 's/[^A-Za-z0-9_]/_/g')`"_end[];" > `(echo %f | tr . _)`.h && \
+       echo "extern const u8" `(echo %b | sed -e 's/^\([0-9]\)/_\1/' -e 's/[^A-Za-z0-9_]/_/g')`"[];" >> `(echo %f | tr . _)`.h && \
+       echo "extern const u32" `(echo %b | sed -e 's/^\([0-9]\)/_\1/' -e 's/[^A-Za-z0-9_]/_/g')`_size";" >> `(echo %f | tr . _)`.h |>
+
+:foreach assets/gfx/*.png |> grit %f -gB4 -at1 -o%o |> build/%B.s | build/%B.h
+
+: assets/map/map.json |> xvfb-run tiled --export-map lua %f %o |> build/map.lua
+
+: build/map.lua |> luajit tmg.lua |> build/bg1.bin
+
+: foreach build/*.bin |> !bin2o |> build/%B.o | build/%B_bin.h
+: foreach source/*.cpp | build/*.h |> $(CXX) $(CXXFLAGS) -c %f -o %o |> build/%B.o
+: foreach source/*.c | build/*.h |> $(CC) -I$(LIBGBA)/include $(CFLAGS) -c %f -o %o |> build/%B.o
+: foreach build/*.s |> $(CC) -x assembler-with-cpp $(ASFLAGS) -c %f -o %o |> build/%B.o
+: build/*.o |> $(LD) $(LDFLAGS) -specs=/opt/devkitpro/devkitARM/arm-none-eabi/lib/gba.specs %f -o %o |> template.elf
+
+: template.elf |> $(OBJCOPY) -O binary %f %o && gbafix %o |> template.gba
