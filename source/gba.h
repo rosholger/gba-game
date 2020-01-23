@@ -22,6 +22,7 @@ typedef struct ObjectAttributes {
     uint16 pad;
 } __attribute__((packed, aligned(4))) ObjectAttributes;
 
+#define MEM_CART_RAM ((volatile uint8 *)0x0E000000)
 
 #define MEM_OAM  ((volatile ObjectAttributes *)0x07000000)
 
@@ -179,9 +180,34 @@ struct DMAChannel
 
 #define KEY_MASK     0xFC00
 
+uint16 prevKeyState;
+uint16 currentKeyState;
+
 static inline
-uint32 getKeyState(uint16 key_code) {
-    return !(key_code & (REG_KEYINPUT | KEY_MASK) );
+void initKeyState() {
+    prevKeyState = 0;
+    currentKeyState = 0;
+}
+
+static inline
+void pumpKeyState() {
+    prevKeyState = currentKeyState;
+    currentKeyState = ~(REG_KEYINPUT | KEY_MASK);
+}
+
+static inline
+uint32 getKeyState(uint16 keyCode) {
+    return !!(keyCode & currentKeyState);
+}
+
+static inline
+uint32 getKeyPressed(uint16 keyCode) {
+    return getKeyState(keyCode) && !(keyCode & prevKeyState);
+}
+
+static inline
+uint32 getKeyReleased(uint16 keyCode) {
+    return !getKeyState(keyCode) && !!(keyCode & prevKeyState);
 }
 
 static inline
@@ -207,7 +233,7 @@ void setSpriteSize16x16(volatile ObjectAttributes *sprite) {
 }
 
 static inline
-void setSpriteSize8x16(volatile ObjectAttributes *sprite) {
+void setSpriteSize32x32(volatile ObjectAttributes *sprite) {
     sprite->attr0 = sprite->attr0 & 0x3FFF;
     sprite->attr1 = (sprite->attr0 & 0x3FFF) | 0x8000;
 }
@@ -225,20 +251,19 @@ void setSpriteSize32x8(volatile ObjectAttributes *sprite) {
 }
 
 static inline
-void setSpriteSize8x32(volatile ObjectAttributes *sprite) {
+void setSpriteSize32x16(volatile ObjectAttributes *sprite) {
     sprite->attr0 = (sprite->attr0 & 0x3FFF) | 0x4000;
     sprite->attr1 = (sprite->attr0 & 0x3FFF) | 0x8000;
 }
 
 static inline
-void setSpriteSize32x32(volatile ObjectAttributes *sprite) {
+void setSpriteSize8x16(volatile ObjectAttributes *sprite) {
     sprite->attr0 = (sprite->attr0 & 0x3FFF) | 0x8000;
-    sprite->attr0 = (sprite->attr0 & 0x3FFF) | 0x4000;
-    sprite->attr1 = sprite->attr0 & 0x3FFF;
+    sprite->attr1 = (sprite->attr1 & 0x3FFF);
 }
 
 static inline
-void setSpriteSize32x16(volatile ObjectAttributes *sprite) {
+void setSpriteSize8x32(volatile ObjectAttributes *sprite) {
     sprite->attr0 = (sprite->attr0 & 0x3FFF) | 0x8000;
     sprite->attr1 = (sprite->attr0 & 0x3FFF) | 0x4000;
 }
@@ -251,20 +276,20 @@ void setSpriteSize16x32(volatile ObjectAttributes *sprite) {
 
 static inline
 void setSpriteSize64x64(volatile ObjectAttributes *sprite) {
-    sprite->attr0 = (sprite->attr0 & 0x3FFF) | 0xC000;
-    sprite->attr1 = sprite->attr0 & 0x3FFF;
+    sprite->attr0 = sprite->attr0 & 0x3FFF;
+    sprite->attr1 = (sprite->attr1 & 0x3FFF) | 0x8000 | 0x4000;
 }
 
 static inline
 void setSpriteSize64x32(volatile ObjectAttributes *sprite) {
-    sprite->attr0 = (sprite->attr0 & 0x3FFF) | 0xC000;
-    sprite->attr1 = (sprite->attr0 & 0x3FFF) | 0x4000;
+    sprite->attr0 = (sprite->attr0 & 0x3FFF) | 0x4000;
+    sprite->attr1 = (sprite->attr1 & 0x3FFF) | 0x8000 | 0x4000;
 }
 
 static inline
 void setSpriteSize32x64(volatile ObjectAttributes *sprite) {
-    sprite->attr0 = (sprite->attr0 & 0x3FFF) | 0xC000;
-    sprite->attr1 = (sprite->attr0 & 0x3FFF) | 0x8000;
+    sprite->attr0 = (sprite->attr0 & 0x3FFF) | 0x8000;
+    sprite->attr1 = (sprite->attr1 & 0x3FFF) | 0x8000 | 0x4000;
 }
 
 static inline

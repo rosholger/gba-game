@@ -41,6 +41,7 @@ extern "C" {
 bool mgba_open(void);
 void mgba_close(void);
 
+void mgba_poprintf(int level, const char* string, ...);
 void mgba_printf(int level, const char* string, ...);
 bool mgba_console_open(void);
 

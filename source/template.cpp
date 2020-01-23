@@ -1,22 +1,35 @@
 #define PROFILER_ENABLED 1
 #define MICRO_PROFILER_ENABLED 1
+#define COLLISION_LOG 1
+#define LIKELY(x) __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
 #include "test1.h"
-#include "tileset.h"
+#include "tilesets.h"
 #include <string.h>
 #include "gba.h"
 #include "fixmath.h"
 #include "ECS.h"
 #include "mgba.h"
 #include "profiler.h"
+#include "ai.h"
+#include "collision.h"
+struct Room {
+    const uint8 x, y, sizeX, sizeY;
+    const uint16 *bg1;
+    const uint8 *collisionLayer;
+};
 #define u8 uint8
 #define u32 uint32
-#include "bg1_bin.h"
+#include "rooms.h"
 #undef u8
 #undef u32
-
 // NOTE: Max rom size (3.355*10^7)
 
+// TODO: Use attributes hot and cold, LIKELY and UNLIKELY etc
+
 // FIXME: Remove ControllerComponent and use FlagsComponent with a CONTROLLER flag instead
+
+// NOTE: Use BIOS compression for all images!
 
 // http://ianfinlayson.net/class/cpsc305/
 //
@@ -63,9 +76,8 @@
 // we might do something like use two bg's where one is offset by 64*8 in x or y, giving us 4x2 or 2x4
 // screens max. Or we could load as much as possible into vmem and swap BG_TILEMAP to change where they
 // point...
-// NOTE: This is wrong, if we use VIDEO_MODE_1 or VIDEO_MODE_2 we get affine backgrounds that can be 128x128, ie 4x4
-// TODO: Investigate how affine matrices work, just switching to VIDEO_MODE_1 does not work...
-// Ah! They use a different mapping scheme...
+
+// NOTE: Copying backgrounds take 13544 cycles ie 4.82% of refresh or 16.17% of vblank
 
 // NOTE: We either need to sort sprites on priority, or make sure that backgrounds only have lowest or highest priority!
 
@@ -74,6 +86,20 @@
 //          Bullets(?) = 1
 //          Enemies = 2-16
 // Background: ?
+
+static inline
+void clearDeadComponents() {
+    while (killedEntitiesHead) {
+        clearDeadComponents<SpriteComponent>(killedEntities[killedEntitiesHead]);
+        clearDeadComponents<PositionComponent>(killedEntities[killedEntitiesHead]);
+        clearDeadComponents<ControllerComponent>(killedEntities[killedEntitiesHead]);
+        clearDeadComponents<FlagsComponent>(killedEntities[killedEntitiesHead]);
+        clearDeadComponents<AIComponent>(killedEntities[killedEntitiesHead]);
+        clearDeadComponents<TileCollisionComponent>(killedEntities[killedEntitiesHead]);
+        pushDeadEntity(killedEntities[killedEntitiesHead]);
+        killedEntitiesHead--;
+    }
+}
 
 #if 0
 typedef uint32 (*Spawner)(uint8 x, uint8 y);
@@ -88,8 +114,48 @@ struct Scene {
     uint8 posX, posY, sizeX, sizeY;
 };
 
-Scene *currentScene;
-const Scene scenes[100][100];
+uint32 spawnerJumper(uint8 tileX, uint8 tileY) {
+    uint32 jumper = newEntity();
+    PositionComponent *position = addComponent<PositionComponent>();
+    position->p.x = tileX*16;
+    position->p.y = tileY*16;
+    SpriteComponent *sprite
+    return jumper;
+}
+
+
+void foobarSpawner(a...) {
+    ...;
+    addAINode(ai, TIMER, compose<xImpulseTowardsPlayer<1.11f>, yImpulse<1.11f> >);
+    ...;
+}
+
+// TODO: How the f**k to support recursive stuff?
+//       maybe store fsm states in const arrays and make this take a pointer to the fsmArray as well as an index?
+//       that would also allow for updating multiple nodes... Might need some way to make node groups so we can update partially or something like that...
+//       Maybe have an uint8 groupTop in AIComponent, and uint8 group in AINode, default to group 0,
+//       have uint8 newAIGroup(AIComponent *), void addAINodeGroup(AIComponent *, AIEventType, AINodeFunc...) and a
+//       removeAINodesInGroup(AIComponent *, uint8)
+//       Maybe write some kind of FSM editor that generates these arrays...
+//       We then have
+struct FSMNode {
+    AIEventType triggerEvent;
+    AINodeFunc run;
+};
+
+const FSMNode bossFSM[][] = {{{TIMER, changeFSM<group, 1>, other stuff to do here}}, {{TIMER, changeFSM<group, 0>}, more stuff}};
+
+template<AIEventType triggerEvent, AINodeFunc nextState>
+void fsm(AIComponent *ai, PositionComponent *position,
+         SpriteComponent *sprite, uint32 entity) {
+    for (AINode *node = ai->nodes; node; node = node->next) {
+        if (node->triggerEvent == triggerEvent) { // FIXME: should only update the fsm node(?)
+            node->run = nextState;
+            break;
+        }
+    }
+}
+
 #endif
 
 void uploadPalletteMemory(const uint16 *palette, PaletteBank *paletteBank) {
@@ -104,19 +170,24 @@ void uploadTileMemory() {
     REG_DMA[3].dst = &MEM_TILE[4][1];
     REG_DMA[3].count = test1TilesLen/4;
     REG_DMA[3].controller = DMA_DST_INC | DMA_SRC_INC | DMA_AT_NOW | DMA_32 | DMA_ENABLE;
-    REG_DMA[3].src = tilesetTiles;
+    REG_DMA[3].src = tilesetsTiles;
     REG_DMA[3].dst = &MEM_TILE[0][0];
-    REG_DMA[3].count = tilesetTilesLen/4;
+    REG_DMA[3].count = tilesetsTilesLen/4;
     REG_DMA[3].controller = DMA_DST_INC | DMA_SRC_INC | DMA_AT_NOW | DMA_32 | DMA_ENABLE;
 }
 
+int16 cameraOffsetX = 0;
+int16 cameraOffsetY = 0;
+
 void updateSpritePosition(SpriteComponent *sprite, PositionComponent *pos) {
-    int32 xScreenPos = (fix24b8ToInt(pos->p.x) + sprite->relX);
-    int32 yScreenPos = (fix24b8ToInt(pos->p.y) + sprite->relY);
-    if (xScreenPos + sprite->sizeX >= 0 && yScreenPos + sprite->sizeY >= 0 &&
-        xScreenPos < 240 && yScreenPos < 160) {
+    int32 worldSpritePosX = (fix24b8ToInt(pos->p.x) + sprite->relX);
+    int32 worldSpritePosY = (fix24b8ToInt(pos->p.y) + sprite->relY);
+    int32 screenSpritePosX = worldSpritePosX - cameraOffsetX;
+    int32 screenSpritePosY = worldSpritePosY - cameraOffsetY;
+    if (screenSpritePosX + sprite->sizeX >= 0 && screenSpritePosY + sprite->sizeY >= 0 &&
+        screenSpritePosX < 240 && screenSpritePosY < 160) {
         enable(sprite->sprite);
-        setSpritePos(sprite->sprite, xScreenPos & 0x1FF, yScreenPos & 0x1FF);
+        setSpritePos(sprite->sprite, screenSpritePosX & 0x1FF, screenSpritePosY & 0x1FF);
     } else {
         disable(sprite->sprite);
     }
@@ -126,80 +197,158 @@ void updatePosition(PositionComponent *pos) {
     pos->p = pos->p + pos->dp;
 }
 
-void updateControllerDp(PositionComponent *pos, ControllerComponent *dummy) {
-    V2fix24b8 ddp = v2fix24b8(getKeyState(KEY_LEFT) * -1.0f + getKeyState(KEY_RIGHT),
-                              getKeyState(KEY_UP) * -1.0f + getKeyState(KEY_DOWN));
-    pos->dp = pos->dp + normalize(ddp) * fix24b8(0.1f);
+void updateControllerDp(PositionComponent *pos, ControllerComponent *dummy, FlagsComponent *flags) {
+    pos->dp.x += fix24b8(getKeyState(KEY_LEFT) * -0.125f + getKeyState(KEY_RIGHT) * 0.125f);
+    if (isSet(&flags->flags, ON_GROUND)) {
+        pos->dp.y = -fix24b8(getKeyPressed(KEY_UP) * 6.0f);
+    }
 }
 
-// 3737 cycles to dma into vram, ie ~1.33% of refresh. 0.2% of ROM
-const uint16 virtualTileMap[20*6][30*6] = {{MAP_ENTRY_PALBANK(1) | 0, MAP_ENTRY_PALBANK(1) | 1, MAP_ENTRY_PALBANK(1) | 2, MAP_ENTRY_PALBANK(1) | 3}, {MAP_ENTRY_PALBANK(1) | 40, MAP_ENTRY_PALBANK(1) | 41, MAP_ENTRY_PALBANK(1) | 42, MAP_ENTRY_PALBANK(1) | 43}};
+void gravitySystem(PositionComponent *pos, GravityComponent *gravity) {
+    pos->dp.y += gravity->value;
+}
+
+void frictionSystem(PositionComponent *pos, FrictionComponent *friction) {
+    pos->dp.x = mul(pos->dp.x, friction->value.x);
+    pos->dp.y = mul(pos->dp.y, friction->value.y);
+}
+
+uint8 cartRamBuffer[512];
+
+__attribute__((section(".wram")))
+uint8 *readCartRam(uint16 location, int16 size) {
+    volatile uint8 *src = &MEM_CART_RAM[location];
+    uint8 *dst = cartRamBuffer;
+    for (;size;--size) {
+        *dst++=*src++;
+    }
+    return cartRamBuffer;
+}
+
+__attribute__((section(".wram")))
+uint8 readCartRam(uint16 location) {
+    return MEM_CART_RAM[location];
+}
+
+const Room *currentRoom;
+
+static inline
+void setCollisionMap() {
+    collisionMapSizeX = currentRoom->sizeX;
+    collisionMapSizeY = currentRoom->sizeY;
+    REG_DMA[3].controller = 0;
+    REG_DMA[3].count = (currentRoom->sizeX * currentRoom->sizeY)/2;
+    REG_DMA[3].dst = collisionMap;
+    REG_DMA[3].src = currentRoom->collisionLayer;
+    REG_DMA[3].controller = DMA_DST_INC | DMA_SRC_INC | DMA_AT_NOW | DMA_16 | DMA_ENABLE;
+
+}
 
 int main() {
     mgba_open();
-    initECS();
     initProfiler();
     uploadPalletteMemory(test1Pal, &MEM_SPRITE_PALETTE[0]);
-    uploadPalletteMemory(tilesetPal, &MEM_BG_PALETTE[1]);
+    uploadPalletteMemory(tilesetsPal, &MEM_BG_PALETTE[1]);
     uploadTileMemory();
+    initKeyState();
+    currentRoom = rooms + roomMap[0][0];
+    setCollisionMap();
 
     volatile ObjectAttributes *spriteAttribs = &MEM_OAM[0];
 
-    setSpriteSize16x16(spriteAttribs);
+    setSpriteSize16x32(spriteAttribs);
     setSprite4bpp(spriteAttribs);
     spriteAttribs->attr2 = 1;      // Start at the first tile in tile
 
     setSpritePos(spriteAttribs, 30, 150);
 
-    REG_BG2_CONTROLLER = BG_TILEBLOCK(0) | BG_TILEMAP(28) | BG_REGULAR_32x32 | BG_4BPP;
-    REG_BG2_AFFINE_X_OFFSET= 0;
-    REG_BG2_AFFINE_Y_OFFSET= 0;
+    REG_BG1_CONTROLLER = BG_TILEBLOCK(0) | BG_TILEMAP(28) | BG_REGULAR_32x32 | BG_4BPP;
 
 
-    REG_DISPLAY_CONTROLLER = VIDEO_MODE_0 | ENABLE_OBJECTS | MAPPINGMODE_1D | ENABLE_BG2;
+    REG_DISPLAY_CONTROLLER = VIDEO_MODE_0 | ENABLE_OBJECTS | MAPPINGMODE_1D | ENABLE_BG1;
 
     uint32 player = newEntity();
 
     PositionComponent *playerPos = addComponent<PositionComponent>(player);
 
     playerPos->dp = v2fix24b8(0, 0);
-    playerPos->p = v2fix24b8(16, 16);
+    playerPos->p = v2fix24b8(64, 64);
 
     SpriteComponent *playerSprite = addComponent<SpriteComponent>(player);
     playerSprite->sprite = spriteAttribs;
     playerSprite->relX = -8;
-    playerSprite->relY = -8;
+    playerSprite->relY = -16;
     playerSprite->sizeX = 16;
-    playerSprite->sizeY = 16;
+    playerSprite->sizeY = 32;
 
     addComponent<ControllerComponent>(player);
 
 
+    TileCollisionComponent *tileCollision = addComponent<TileCollisionComponent>(player);
+    tileCollision->upperLeft.x = fix24b8(-8);
+    tileCollision->upperLeft.y = fix24b8(-16);
+    tileCollision->size.x = fix24b8(16);
+    tileCollision->size.y = fix24b8(32);
+
+    GravityComponent *gravity = addComponent<GravityComponent>(player);
+    gravity->value = fix24b8(0.3f);
+
+    FrictionComponent *friction = addComponent<FrictionComponent>(player);
+    friction->value = v2fix24b8(0.95f, 0.99f);
+
+    FlagsComponent *flags = addComponent<FlagsComponent>(player);
+    (void)flags;
 
     while (1) {
+        pumpKeyState();
         vsync();
+        PROFILE("main loop");
+        cameraOffsetX = fix24b8ToInt(playerPos->p.x - fix24b8(120.0f));
+        if (cameraOffsetX < 0) {
+            cameraOffsetX = 0;
+        }
+        cameraOffsetY = fix24b8ToInt(playerPos->p.y - fix24b8(80.0f));
+        if (cameraOffsetY < 0) {
+            cameraOffsetY = 0;
+        }
+        {
+            PROFILE("update sprite position");
+            systemRun<SpriteComponent, PositionComponent>(updateSpritePosition);
+        }
         MICRO_PROFILE_START();
+        REG_BG1_REGULAR_X_OFFSET = cameraOffsetX & 0x7; // ie mod 8
+        REG_BG1_REGULAR_Y_OFFSET = cameraOffsetY & 0x7;
+        int16 tileOffsetX = cameraOffsetX/8;
+        int16 tileOffsetY = cameraOffsetY/8;
         REG_DMA[3].controller = 0;
-        REG_DMA[3].count = 30;
-        for (int i = 0; i < 20; ++i) {
+        REG_DMA[3].count = min(currentRoom->sizeX*2 - tileOffsetX, 31);
+        MICRO_PROFILE_STOP("DMA CONSTANT TIME");
+        MICRO_PROFILE_START();
+        for (int i = 0; i < min(currentRoom->sizeY*2 - tileOffsetY, 21); ++i) {
             REG_DMA[3].dst = &MEM_MAP[28][i*32];
-            REG_DMA[3].src = &bg1_bin[i*30*2];
+            REG_DMA[3].src = &currentRoom->bg1[tileOffsetX + (tileOffsetY + i)*currentRoom->sizeX*2];
             REG_DMA[3].controller = DMA_DST_INC | DMA_SRC_INC | DMA_AT_NOW | DMA_16 | DMA_ENABLE;
         }
-        MICRO_PROFILE_STOP("DMA");
-        mgba_printf(MGBA_LOG_DEBUG, "%u", bg1_bin_size);
-        //PROFILE("main loop");
+        MICRO_PROFILE_STOP("DMA LAYER");
         {
-            //PROFILE("update controller");
-            systemRun<PositionComponent, ControllerComponent>(updateControllerDp);
+            PROFILE("update controller");
+            systemRun<PositionComponent, ControllerComponent, FlagsComponent>(updateControllerDp);
         }
         {
-            //PROFILE("update position");
+            PROFILE("gravity position");
+            systemRun<PositionComponent, GravityComponent>(gravitySystem);
+        }
+        {
+            PROFILE("friction position");
+            systemRun<PositionComponent, FrictionComponent>(frictionSystem);
+        }
+        {
+            PROFILE("update position");
             systemRun<PositionComponent>(updatePosition);
         }
         {
-            //PROFILE("update sprite position");
-            systemRun<SpriteComponent, PositionComponent>(updateSpritePosition);
+            PROFILE("tile collision");
+            systemRun<PositionComponent, TileCollisionComponent, FlagsComponent>(collisionSystem);
         }
     }
 }
